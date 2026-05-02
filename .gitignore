@@ -1,0 +1,46 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.egg-info/
+dist/
+build/
+
+# Environment
+.env
+.env.local
+.env.*.local
+venv/
+.venv/
+
+# macOS
+.DS_Store
+
+# dbt
+target/
+dbt_packages/
+dbt_modules/
+
+# Airflow
+logs/
+*.log
+airflow.db
+airflow.cfg
+webserver_config.py
+standalone_admin_password.txt
+
+# Jupyter
+.ipynb_checkpoints/
+*.ipynb
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Snowflake / credentials
+*.p8
+*.pem
+profiles.yml

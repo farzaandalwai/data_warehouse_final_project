@@ -1,0 +1,8 @@
+pandas
+requests
+snowflake-connector-python
+python-dotenv
+scikit-learn
+apache-airflow
+dbt-core
+dbt-snowflake

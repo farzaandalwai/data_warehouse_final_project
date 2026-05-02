@@ -1,0 +1,58 @@
+version: 2
+
+sources:
+  - name: raw
+    description: >
+      Raw landing tables loaded directly from source APIs by the Airflow ETL pipeline.
+      No transformations are applied in this layer.
+    database: ELECTRICITY_MARKET_DB
+    schema: RAW
+
+    tables:
+      - name: eia_hourly_ops
+        description: >
+          Hourly electricity grid operations data sourced from the EIA Open Data API.
+          One row per hour per balancing authority.
+        columns:
+          - name: period
+            description: Hour of the operating interval (UTC, TIMESTAMP_NTZ).
+          - name: balancing_authority
+            description: EIA balancing authority abbreviation (e.g. CISO, MISO, PJM).
+          - name: demand_mwh
+            description: Actual hourly electricity demand in megawatt-hours.
+          - name: demand_forecast_mwh
+            description: Day-ahead demand forecast in megawatt-hours.
+          - name: net_generation_mwh
+            description: Net generation across all fuel types in megawatt-hours.
+          - name: interchange_mwh
+            description: Net interchange with neighbouring BAs (positive = export).
+          - name: source_system
+            description: Identifier for the originating system (eia_api).
+          - name: loaded_at
+            description: UTC timestamp when this row was loaded into Snowflake.
+
+      - name: caiso_lmp_5min
+        description: >
+          5-minute locational marginal price (LMP) data from CAISO OASIS.
+          One row per 5-minute interval per trading hub.
+        columns:
+          - name: interval_start
+            description: Start of the 5-minute pricing interval (UTC, TIMESTAMP_NTZ).
+          - name: interval_end
+            description: End of the 5-minute pricing interval (UTC, TIMESTAMP_NTZ).
+          - name: trading_hub
+            description: CAISO trading hub identifier (NP15, SP15, or ZP26).
+          - name: lmp
+            description: Locational marginal price in $/MWh.
+          - name: energy_component
+            description: Energy component of the LMP in $/MWh.
+          - name: congestion_component
+            description: Congestion component of the LMP in $/MWh.
+          - name: loss_component
+            description: Loss component of the LMP in $/MWh.
+          - name: market
+            description: Market type — RTM (real-time) or DAM (day-ahead).
+          - name: source_system
+            description: Identifier for the originating system (caiso_oasis).
+          - name: loaded_at
+            description: UTC timestamp when this row was loaded into Snowflake.
