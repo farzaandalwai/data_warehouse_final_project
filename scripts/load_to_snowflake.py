@@ -26,6 +26,13 @@ from snowflake.connector.pandas_tools import write_pandas
 
 load_dotenv()
 
+# Timestamp columns that must be serialised to strings before write_pandas.
+# write_pandas can misinterpret pandas datetime64 values when the target
+# Snowflake column type is TIMESTAMP_NTZ, producing corrupted "Invalid Date"
+# or impossible negative-year values. Sending explicit strings bypasses that.
+_TIMESTAMP_COLS = ["interval_start", "interval_end", "loaded_at"]
+_TIMESTAMP_FMT  = "%Y-%m-%d %H:%M:%S"
+
 
 # ---------------------------------------------------------------------------
 # Connection factory
@@ -76,6 +83,55 @@ def get_snowflake_connection() -> snowflake.connector.SnowflakeConnection:
 
 
 # ---------------------------------------------------------------------------
+# DataFrame preparation
+# ---------------------------------------------------------------------------
+
+def prepare_dataframe_for_snowflake(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Return a cleaned copy of `df` that is safe to pass to write_pandas.
+
+    Two transformations are applied in order:
+      1. Timestamp columns are converted to plain 'YYYY-MM-DD HH:MM:SS' strings.
+         This avoids write_pandas misinterpreting pandas datetime64 values as
+         corrupted or negative-year timestamps in Snowflake TIMESTAMP_NTZ columns.
+      2. All column names are uppercased to match Snowflake DDL conventions.
+
+    Parameters
+    ----------
+    df : pd.DataFrame
+        Raw DataFrame as returned by the extraction layer.
+
+    Returns
+    -------
+    pd.DataFrame
+        Cleaned DataFrame ready for write_pandas.
+    """
+    df = df.copy()
+
+    # Step 1 — Serialise timestamp columns to strings
+    for col in _TIMESTAMP_COLS:
+        if col not in df.columns:
+            continue
+
+        parsed = pd.to_datetime(df[col], errors="coerce")
+
+        null_count = parsed.isna().sum()
+        if null_count > 0:
+            print(
+                f"[prepare_dataframe_for_snowflake] WARNING: column '{col}' has "
+                f"{null_count} value(s) that could not be parsed as a timestamp "
+                f"and will be loaded as NULL."
+            )
+
+        df[col] = parsed.dt.strftime(_TIMESTAMP_FMT)
+
+    # Step 2 — Uppercase column names to align with Snowflake DDL
+    df.columns = [c.upper() for c in df.columns]
+
+    return df
+
+
+# ---------------------------------------------------------------------------
 # Idempotent delete helper
 # ---------------------------------------------------------------------------
 
@@ -83,7 +139,7 @@ def delete_existing_caiso_rows_for_date(load_date: str) -> int:
     """
     Delete all rows from RAW.CAISO_LMP_5MIN where DATE(INTERVAL_START) matches
     load_date. This makes repeated loads for the same date idempotent —
-    re-running will replace the day's data rather than appending duplicates.
+    re-running replaces the day's data rather than appending duplicates.
 
     Parameters
     ----------
@@ -113,6 +169,32 @@ def delete_existing_caiso_rows_for_date(load_date: str) -> int:
 
 
 # ---------------------------------------------------------------------------
+# Truncate helper
+# ---------------------------------------------------------------------------
+
+def truncate_table(table_name: str, schema: str = "RAW") -> None:
+    """
+    Truncate all rows from schema.table_name.
+
+    Used during the smoke test to clear corrupted data before a clean reload.
+
+    Parameters
+    ----------
+    table_name : str
+        Name of the table to truncate, e.g. 'CAISO_LMP_5MIN'.
+    schema : str
+        Schema containing the table. Defaults to 'RAW'.
+    """
+    conn = get_snowflake_connection()
+    try:
+        cursor = conn.cursor()
+        cursor.execute(f"TRUNCATE TABLE {schema}.{table_name}")
+        print(f"[truncate_table] Truncated {schema}.{table_name}.")
+    finally:
+        conn.close()
+
+
+# ---------------------------------------------------------------------------
 # DataFrame loader
 # ---------------------------------------------------------------------------
 
@@ -122,10 +204,11 @@ def load_dataframe_to_table(
     schema: str | None = None,
 ) -> int:
     """
-    Load a pandas DataFrame into a Snowflake table using write_pandas.
+    Prepare and load a pandas DataFrame into a Snowflake table using write_pandas.
 
     The target table must already exist (managed via sql/02_create_raw_tables.sql).
-    Column names are uppercased automatically to match Snowflake conventions.
+    Timestamp columns are serialised to strings and column names are uppercased
+    before the load — see prepare_dataframe_for_snowflake() for details.
 
     Parameters
     ----------
@@ -157,15 +240,14 @@ def load_dataframe_to_table(
         f"{target_db}.{target_schema}.{table_name.upper()} ..."
     )
 
-    # write_pandas matches on column names — uppercase to align with Snowflake DDL
-    df = df.copy()
-    df.columns = [c.upper() for c in df.columns]
+    # Serialise timestamps and uppercase columns before sending to Snowflake
+    df_clean = prepare_dataframe_for_snowflake(df)
 
     conn = get_snowflake_connection()
     try:
         success, num_chunks, num_rows, _ = write_pandas(
             conn=conn,
-            df=df,
+            df=df_clean,
             table_name=table_name.upper(),
             database=target_db,
             schema=target_schema,
@@ -187,13 +269,10 @@ def load_dataframe_to_table(
 
 
 # ---------------------------------------------------------------------------
-# Main — smoke test: extract CAISO data and load to Snowflake
+# Main — smoke test: clean reload with fixed timestamps
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
-    # Allow running as `python scripts/load_to_snowflake.py` from the project root.
-    # sys.path[0] is already the scripts/ directory when the script is run directly,
-    # so extract_caiso_lmp is importable as a sibling module.
     sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
     from extract_caiso_lmp import extract_caiso_lmp
 
@@ -201,7 +280,7 @@ if __name__ == "__main__":
     TEST_HUBS = ["NP15", "SP15", "ZP26"]
 
     print("=" * 60)
-    print("Step 2 smoke test: extract CAISO LMP → load to Snowflake")
+    print("Timestamp-fix smoke test: extract CAISO LMP → load to Snowflake")
     print(f"Date  : {TEST_DATE}")
     print(f"Hubs  : {TEST_HUBS}")
     print("=" * 60)
@@ -211,11 +290,11 @@ if __name__ == "__main__":
     df = extract_caiso_lmp(TEST_DATE, TEST_DATE, TEST_HUBS)
     print(f"\nExtracted {len(df):,} rows.")
 
-    # 2. Delete existing rows for the date (idempotency)
-    print("\n--- Pre-load delete ---")
-    delete_existing_caiso_rows_for_date(TEST_DATE)
+    # 2. Truncate the table to clear previously corrupted timestamp data
+    print("\n--- Truncating RAW.CAISO_LMP_5MIN (clearing corrupted rows) ---")
+    truncate_table("CAISO_LMP_5MIN", schema="RAW")
 
-    # 3. Load into Snowflake
+    # 3. Load with clean string timestamps
     print("\n--- Load ---")
     rows_loaded = load_dataframe_to_table(df, table_name="CAISO_LMP_5MIN", schema="RAW")
 
