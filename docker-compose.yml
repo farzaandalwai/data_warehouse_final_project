@@ -1,0 +1,157 @@
+# =============================================================================
+# docker-compose.yml
+# Wholesale Electricity Market Stress and Price Spike Forecasting
+# =============================================================================
+#
+# Services:
+#   postgres          — Airflow metadata database
+#   airflow-init      — One-time DB migration + admin user creation
+#   airflow-webserver — Airflow UI on http://localhost:8080
+#   airflow-scheduler — Airflow task scheduler
+#   mlflow            — MLflow experiment tracking on http://localhost:5001
+#
+# Credentials loaded from: .env  (gitignored — never committed)
+# Start:  docker compose up -d
+# Stop:   docker compose down
+# Logs:   docker compose logs -f airflow-webserver
+# =============================================================================
+
+# ---------------------------------------------------------------------------
+# YAML anchor — shared config reused by all Airflow services
+# ---------------------------------------------------------------------------
+x-airflow-common:
+  &airflow-common
+  build: .
+  env_file:
+    - .env                          # Snowflake + EIA credentials from local .env
+  environment:
+    &airflow-common-env
+    AIRFLOW__CORE__EXECUTOR: LocalExecutor
+    AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@postgres/airflow
+    AIRFLOW__CORE__LOAD_EXAMPLES: "false"
+    AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: "true"
+    AIRFLOW__WEBSERVER__SECRET_KEY: temporary_class_project_secret
+    # dbt profile directory mounted into the container
+    DBT_PROFILES_DIR: /opt/airflow/dbt_profiles
+    # MLflow tracking server running in its own container
+    MLFLOW_TRACKING_URI: http://mlflow:5000
+  volumes:
+    - ./airflow/dags:/opt/airflow/dags
+    - ./scripts:/opt/airflow/scripts
+    - ./dbt/electricity_market:/opt/airflow/dbt/electricity_market
+    - ./dbt/profiles:/opt/airflow/dbt_profiles
+    - ./logs:/opt/airflow/logs
+    - ./mlruns:/opt/airflow/mlruns
+  depends_on:
+    postgres:
+      condition: service_healthy
+
+
+# ---------------------------------------------------------------------------
+# Services
+# ---------------------------------------------------------------------------
+services:
+
+  # --------------------------------------------------------------------------
+  # postgres — Airflow metadata database
+  # --------------------------------------------------------------------------
+  postgres:
+    image: postgres:13
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: airflow
+      POSTGRES_PASSWORD: airflow
+      POSTGRES_DB: airflow
+    volumes:
+      - postgres-db-volume:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "airflow"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # --------------------------------------------------------------------------
+  # airflow-init — runs once to migrate the DB and create the admin user
+  # Downstream services use condition: service_completed_successfully so they
+  # only start after this exits 0.
+  # --------------------------------------------------------------------------
+  airflow-init:
+    <<: *airflow-common
+    restart: "no"
+    command: >
+      bash -c "
+        airflow db migrate &&
+        airflow users create
+          --username admin
+          --password admin
+          --firstname Admin
+          --lastname User
+          --role Admin
+          --email admin@example.com
+      "
+
+  # --------------------------------------------------------------------------
+  # airflow-webserver — Airflow UI at http://localhost:8080
+  # Login: admin / admin
+  # --------------------------------------------------------------------------
+  airflow-webserver:
+    <<: *airflow-common
+    restart: unless-stopped
+    command: webserver
+    ports:
+      - "8080:8080"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      airflow-init:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+
+  # --------------------------------------------------------------------------
+  # airflow-scheduler — triggers DAG runs on schedule
+  # --------------------------------------------------------------------------
+  airflow-scheduler:
+    <<: *airflow-common
+    restart: unless-stopped
+    command: scheduler
+    depends_on:
+      postgres:
+        condition: service_healthy
+      airflow-init:
+        condition: service_completed_successfully
+
+  # --------------------------------------------------------------------------
+  # mlflow — experiment tracking UI at http://localhost:5001
+  # Uses SQLite for the backend store (adequate for a class project).
+  # Artifacts are written to /mlflow/mlruns which is bind-mounted to ./mlruns.
+  # --------------------------------------------------------------------------
+  mlflow:
+    image: python:3.11-slim
+    restart: unless-stopped
+    command: >
+      sh -c "
+        pip install --quiet mlflow &&
+        mlflow server
+          --host 0.0.0.0
+          --port 5000
+          --backend-store-uri sqlite:////mlflow/mlflow.db
+          --default-artifact-root /mlflow/mlruns
+      "
+    ports:
+      - "5001:5000"             # MLflow UI → http://localhost:5001
+    volumes:
+      - ./mlruns:/mlflow/mlruns
+      - mlflow-db-volume:/mlflow
+
+
+# ---------------------------------------------------------------------------
+# Named volumes
+# ---------------------------------------------------------------------------
+volumes:
+  postgres-db-volume:
+  mlflow-db-volume:
