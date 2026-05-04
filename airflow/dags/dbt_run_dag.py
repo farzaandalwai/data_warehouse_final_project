@@ -26,16 +26,20 @@ from airflow.operators.bash import BashOperator
 
 
 # ---------------------------------------------------------------------------
-# dbt project path — resolved dynamically relative to this DAG file.
+# dbt project path
 #
-# DAG file location : airflow/dags/dbt_run_dag.py
-# Going up two levels from this file reaches the project root, then we
-# descend into dbt/electricity_market. This avoids hardcoding any personal
-# absolute path and works wherever the repo is checked out.
+# Inside Docker Compose, the dbt project is mounted at:
+#   ./dbt/electricity_market → /opt/airflow/dbt/electricity_market
+# (see the volumes section of docker-compose.yml)
+#
+# The DBT_PROJECT_DIR environment variable can be set to override this path
+# for local development outside Docker. If the variable is not set, the
+# Docker mount path is used as the default.
 # ---------------------------------------------------------------------------
-_DAG_DIR        = os.path.dirname(os.path.abspath(__file__))
-_PROJECT_ROOT   = os.path.abspath(os.path.join(_DAG_DIR, "..", ".."))
-DBT_PROJECT_DIR = os.path.join(_PROJECT_ROOT, "dbt", "electricity_market")
+DBT_PROJECT_DIR = os.environ.get(
+    "DBT_PROJECT_DIR",
+    "/opt/airflow/dbt/electricity_market",
+)
 
 
 # ---------------------------------------------------------------------------
