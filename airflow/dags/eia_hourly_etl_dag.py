@@ -1,14 +1,23 @@
 """
 eia_hourly_etl_dag.py
 ---------------------
-Airflow DAG that orchestrates the daily extraction of EIA hourly electricity
-operations data from the EIA Open Data API and loads it into Snowflake
-RAW.EIA_HOURLY_OPS.
+Daily ETL DAG that extracts hourly grid operations data from the EIA Open
+Data API v2, deletes any existing rows for that date and balancing authority
+(idempotency), and loads the result into Snowflake RAW.EIA_HOURLY_OPS.
 
-Schedule : Daily at 03:00 UTC (EIA data is typically available by 02:00 UTC)
-Owner    : data-engineering
+Pipeline  : EIA Open Data API v2 → extract_eia_hourly() → delete stale rows
+            → load_dataframe_to_table() → Snowflake RAW.EIA_HOURLY_OPS
+
+EIA data for a given day is fully published by ~02:00 UTC the same day,
+so this DAG is scheduled one hour after the CAISO DAG (02:00 UTC) to avoid
+warehouse contention while still finishing before the dbt DAG (04:00 UTC).
+
+Schedule  : Daily at 03:00 UTC
+Owner     : group_8
 """
 
+import os
+import sys
 from datetime import datetime, timedelta
 
 from airflow import DAG
@@ -16,75 +25,100 @@ from airflow.operators.python import PythonOperator
 
 
 # ---------------------------------------------------------------------------
-# Default arguments applied to every task in this DAG
+# Path setup
+# Resolve the project root two directories above this DAG file:
+#   airflow/dags/eia_hourly_etl_dag.py  →  airflow/  →  project root
+# This ensures `from scripts.xxx import yyy` works on any Airflow worker
+# regardless of the working directory or PYTHONPATH configuration.
 # ---------------------------------------------------------------------------
+_PROJECT_ROOT = os.path.abspath(
+    os.path.join(os.path.dirname(__file__), "..", "..")
+)
+if _PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, _PROJECT_ROOT)
+
+from scripts.extract_eia_hourly import extract_eia_hourly           # noqa: E402
+from scripts.load_to_snowflake import (                              # noqa: E402
+    delete_existing_eia_rows_for_date,
+    load_dataframe_to_table,
+)
+
+
+# ---------------------------------------------------------------------------
+# Constants
+# ---------------------------------------------------------------------------
+
+BALANCING_AUTHORITY = "CISO"   # California ISO — expand list as project grows
+
+
+# ---------------------------------------------------------------------------
+# Default arguments
+# ---------------------------------------------------------------------------
+
 DEFAULT_ARGS = {
-    "owner": "data-engineering",
+    "owner": "group_8",
     "depends_on_past": False,
     "email_on_failure": False,
     "email_on_retry": False,
-    "retries": 2,
-    "retry_delay": timedelta(minutes=10),
+    "retries": 1,
+    "retry_delay": timedelta(minutes=5),
 }
 
-# ---------------------------------------------------------------------------
-# Balancing authorities to extract data for
-# ---------------------------------------------------------------------------
-BALANCING_AUTHORITIES = ["CISO"]   # Start with CAISO; expand list as needed
-
 
 # ---------------------------------------------------------------------------
-# Task callables
+# Task callable
 # ---------------------------------------------------------------------------
 
-def extract_eia_hourly_task(**context) -> None:
+def run_eia_hourly_etl(**context) -> None:
     """
-    Extract hourly operations data from the EIA API for the execution date
-    and push the resulting DataFrame to XCom for the downstream load task.
+    Single-task ETL callable that runs the full extract → delete → load cycle
+    for the EIA hourly data on the Airflow logical date (ds).
 
-    TODO: Import extract_eia_hourly from scripts.extract_eia_hourly.
-          Ensure the scripts/ directory is on the Python path (configure in
-          airflow.cfg or add a PYTHONPATH entry in the Airflow environment).
-          Ensure EIA_API_KEY is available as an Airflow Variable or environment
-          variable within the worker environment.
+    Steps
+    -----
+    1. Build EIA date range: T00 through T23 for the logical date.
+    2. Extract hourly grid operations from the EIA API for CISO.
+    3. Raise ValueError if no data was returned (prevents a silent empty load).
+    4. Delete any existing EIA rows for that date + BA (idempotency).
+    5. Load the extracted DataFrame into RAW.EIA_HOURLY_OPS.
     """
-    execution_date = context["ds"]  # YYYY-MM-DD string for the DAG run date
+    load_date: str = context["ds"]   # Airflow logical date — 'YYYY-MM-DD'
 
-    # TODO: Uncomment and connect to the real extraction function:
-    # import pandas as pd
-    # from scripts.extract_eia_hourly import extract_eia_hourly
-    #
-    # all_dfs = []
-    # for ba in BALANCING_AUTHORITIES:
-    #     df = extract_eia_hourly(
-    #         start_date=execution_date,
-    #         end_date=execution_date,
-    #         balancing_authority=ba,
-    #     )
-    #     all_dfs.append(df)
-    #
-    # combined_df = pd.concat(all_dfs, ignore_index=True)
-    # context["ti"].xcom_push(key="eia_hourly_df", value=combined_df.to_json())
+    # EIA API v2 hourly endpoint expects 'YYYY-MM-DDTHH' format
+    start_date = f"{load_date}T00"
+    end_date   = f"{load_date}T23"
 
-    print(f"[extract_eia_hourly_task] Extraction placeholder for date={execution_date}")
+    print(
+        f"[eia_hourly_etl] Starting ETL for date={load_date}, "
+        f"BA={BALANCING_AUTHORITY}"
+    )
 
+    # Step 1 — Extract
+    df = extract_eia_hourly(
+        start_date=start_date,
+        end_date=end_date,
+        balancing_authority=BALANCING_AUTHORITY,
+    )
+    print(f"[eia_hourly_etl] Extracted {len(df):,} rows for date={load_date}.")
 
-def load_eia_hourly_to_snowflake_task(**context) -> None:
-    """
-    Pull the extracted EIA DataFrame from XCom and load it into Snowflake.
+    # Step 2 — Guard against empty extractions
+    if df.empty:
+        raise ValueError(
+            f"EIA extraction returned 0 rows for date={load_date}, "
+            f"BA={BALANCING_AUTHORITY}. "
+            "Aborting load to prevent an empty write."
+        )
 
-    TODO: Import load_dataframe_to_table from scripts.load_to_snowflake.
-          Deserialise the DataFrame from JSON before passing it to the loader.
-    """
-    # TODO: Uncomment and connect to the real load function:
-    # import pandas as pd
-    # from scripts.load_to_snowflake import load_dataframe_to_table
-    #
-    # raw_json = context["ti"].xcom_pull(task_ids="extract_eia_hourly", key="eia_hourly_df")
-    # df = pd.read_json(raw_json)
-    # load_dataframe_to_table(df, table_name="EIA_HOURLY_OPS", schema="RAW")
+    # Step 3 — Delete existing rows for this date + BA (idempotency)
+    delete_existing_eia_rows_for_date(load_date, BALANCING_AUTHORITY)
 
-    print("[load_eia_hourly_to_snowflake_task] Load placeholder — Snowflake not yet connected.")
+    # Step 4 — Load into Snowflake
+    rows_loaded = load_dataframe_to_table(df, "EIA_HOURLY_OPS", schema="RAW")
+
+    print(
+        f"[eia_hourly_etl] Done. {rows_loaded:,} rows loaded into "
+        f"RAW.EIA_HOURLY_OPS for date={load_date}, BA={BALANCING_AUTHORITY}."
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -93,23 +127,18 @@ def load_eia_hourly_to_snowflake_task(**context) -> None:
 
 with DAG(
     dag_id="eia_hourly_etl_dag",
-    description="Daily extraction of EIA hourly grid operations data into Snowflake RAW",
+    description=(
+        "Daily extraction of EIA hourly grid operations data (CISO) "
+        "into Snowflake RAW.EIA_HOURLY_OPS"
+    ),
     default_args=DEFAULT_ARGS,
     start_date=datetime(2024, 1, 1),
-    schedule_interval="0 3 * * *",   # 03:00 UTC daily
+    schedule_interval="0 3 * * *",   # 03:00 UTC — after CAISO DAG, before dbt DAG
     catchup=False,
-    tags=["eia", "hourly", "etl", "raw"],
+    tags=["eia", "etl", "snowflake"],
 ) as dag:
 
-    extract_task = PythonOperator(
-        task_id="extract_eia_hourly",
-        python_callable=extract_eia_hourly_task,
+    extract_load_eia_hourly = PythonOperator(
+        task_id="extract_load_eia_hourly",
+        python_callable=run_eia_hourly_etl,
     )
-
-    load_task = PythonOperator(
-        task_id="load_eia_hourly_to_snowflake",
-        python_callable=load_eia_hourly_to_snowflake_task,
-    )
-
-    # Task dependency: extract must succeed before load runs
-    extract_task >> load_task
