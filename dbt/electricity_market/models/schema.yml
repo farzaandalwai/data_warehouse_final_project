@@ -1,0 +1,157 @@
+version: 2
+
+models:
+
+  # ---------------------------------------------------------------------------
+  # Staging layer
+  # ---------------------------------------------------------------------------
+
+  - name: stg_caiso_lmp
+    description: >
+      Hourly aggregation of CAISO 5-minute LMP data by trading hub and market
+      type. Each row represents one hour for one hub (e.g. NP15 RTM).
+    columns:
+      - name: hour_utc
+        description: Hour of the interval, truncated from interval_start (UTC).
+        data_tests:
+          - not_null
+
+      - name: trading_hub
+        description: CAISO trading hub identifier (NP15, SP15, or ZP26).
+        data_tests:
+          - not_null
+          - accepted_values:
+              config:
+                severity: warn
+              arguments:
+                values: ["NP15", "SP15", "ZP26"]
+
+      - name: market
+        description: Market type — RTM (real-time) or DAM (day-ahead).
+        data_tests:
+          - not_null
+
+      - name: lmp_avg
+        description: Average LMP across all 5-minute intervals within the hour ($/MWh).
+        data_tests:
+          - not_null
+
+  # ---------------------------------------------------------------------------
+  # Intermediate layer
+  # ---------------------------------------------------------------------------
+
+  - name: int_hourly_market_features
+    description: >
+      Hourly feature table joining CAISO LMP with EIA grid operations data.
+      Adds time-series lag features (1h, 24h, 168h) and calendar features
+      for downstream ML modelling.
+    columns:
+      - name: hour_utc
+        description: Hour of the interval (UTC).
+        data_tests:
+          - not_null
+
+      - name: trading_hub
+        description: CAISO trading hub identifier (NP15, SP15, or ZP26).
+        data_tests:
+          - not_null
+
+      - name: lmp_avg
+        description: Average hourly LMP ($/MWh), inherited from stg_caiso_lmp.
+        data_tests:
+          - not_null
+
+      - name: hour_of_day
+        description: Hour of day extracted from hour_utc (0–23).
+        data_tests:
+          - not_null
+
+      - name: day_of_week
+        description: Day of week extracted from hour_utc (0=Monday in Snowflake).
+        data_tests:
+          - not_null
+
+  # ---------------------------------------------------------------------------
+  # Mart layer
+  # ---------------------------------------------------------------------------
+
+  - name: mart_hourly_market_stress
+    description: >
+      Analytics-ready table classifying each hour per trading hub as a price
+      spike event. Includes 95th and 99th percentile thresholds and a
+      stress severity label (NORMAL / ELEVATED / SPIKE / EXTREME).
+    columns:
+      - name: hour_utc
+        description: Hour of the interval (UTC).
+        data_tests:
+          - not_null
+
+      - name: trading_hub
+        description: CAISO trading hub identifier (NP15, SP15, or ZP26).
+        data_tests:
+          - not_null
+          - accepted_values:
+              arguments:
+                values: ["NP15", "SP15", "ZP26"]
+
+      - name: lmp_avg
+        description: Average hourly LMP ($/MWh).
+        data_tests:
+          - not_null
+
+      - name: price_spike_flag
+        description: Binary flag — 1 if lmp_avg exceeds the hub p95 threshold, else 0.
+        data_tests:
+          - not_null
+          - accepted_values:
+              arguments:
+                values: [0, 1]
+
+      - name: stress_severity
+        description: Categorical stress label derived from LMP vs. historical thresholds.
+        data_tests:
+          - not_null
+          - accepted_values:
+              arguments:
+                values: ["NORMAL", "ELEVATED", "SPIKE", "EXTREME"]
+
+  - name: mart_price_spike_dashboard
+    description: >
+      Dashboard-ready table with curated, rounded columns for BI tool consumption.
+      Sourced directly from mart_hourly_market_stress.
+    columns:
+      - name: hour_utc
+        description: Hour of the interval (UTC).
+        data_tests:
+          - not_null
+
+      - name: trading_hub
+        description: CAISO trading hub identifier (NP15, SP15, or ZP26).
+        data_tests:
+          - not_null
+          - accepted_values:
+              arguments:
+                values: ["NP15", "SP15", "ZP26"]
+
+      - name: lmp_avg_usd_mwh
+        description: >
+          Average hourly LMP rounded to 2 decimal places ($/MWh).
+          Note: renamed from lmp_avg in mart_hourly_market_stress.
+        data_tests:
+          - not_null
+
+      - name: price_spike_flag
+        description: Binary spike flag — 1 = spike, 0 = no spike.
+        data_tests:
+          - not_null
+          - accepted_values:
+              arguments:
+                values: [0, 1]
+
+      - name: stress_severity
+        description: Categorical stress label.
+        data_tests:
+          - not_null
+          - accepted_values:
+              arguments:
+                values: ["NORMAL", "ELEVATED", "SPIKE", "EXTREME"]
