@@ -30,7 +30,8 @@ load_dotenv()
 # write_pandas can misinterpret pandas datetime64 values when the target
 # Snowflake column type is TIMESTAMP_NTZ, producing corrupted "Invalid Date"
 # or impossible negative-year values. Sending explicit strings bypasses that.
-_TIMESTAMP_COLS = ["interval_start", "interval_end", "loaded_at"]
+# Covers both CAISO columns (interval_start/end) and EIA column (period).
+_TIMESTAMP_COLS = ["interval_start", "interval_end", "loaded_at", "period"]
 _TIMESTAMP_FMT  = "%Y-%m-%d %H:%M:%S"
 
 
@@ -169,6 +170,49 @@ def delete_existing_caiso_rows_for_date(load_date: str) -> int:
 
 
 # ---------------------------------------------------------------------------
+# Idempotent delete helper — EIA
+# ---------------------------------------------------------------------------
+
+def delete_existing_eia_rows_for_date(
+    load_date: str,
+    balancing_authority: str = "CISO",
+) -> int:
+    """
+    Delete rows from RAW.EIA_HOURLY_OPS for a specific date and balancing
+    authority. Scoping the delete to both dimensions avoids accidentally
+    removing data for other BAs loaded on the same day.
+
+    Parameters
+    ----------
+    load_date : str
+        Date string in 'YYYY-MM-DD' format.
+    balancing_authority : str
+        EIA balancing authority code, e.g. 'CISO'. Defaults to 'CISO'.
+
+    Returns
+    -------
+    int
+        Number of rows deleted.
+    """
+    conn = get_snowflake_connection()
+    try:
+        cursor = conn.cursor()
+        cursor.execute(
+            "DELETE FROM RAW.EIA_HOURLY_OPS "
+            "WHERE DATE(PERIOD) = %s AND BALANCING_AUTHORITY = %s",
+            (load_date, balancing_authority),
+        )
+        deleted = cursor.rowcount
+        print(
+            f"[delete_existing_eia_rows_for_date] "
+            f"Deleted {deleted} existing rows for date={load_date}, BA={balancing_authority}"
+        )
+        return deleted
+    finally:
+        conn.close()
+
+
+# ---------------------------------------------------------------------------
 # Truncate helper
 # ---------------------------------------------------------------------------
 
@@ -269,35 +313,67 @@ def load_dataframe_to_table(
 
 
 # ---------------------------------------------------------------------------
-# Main — smoke test: clean reload with fixed timestamps
+# Main — smoke test: CAISO + EIA load
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
     sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
     from extract_caiso_lmp import extract_caiso_lmp
+    from extract_eia_hourly import extract_eia_hourly
 
-    TEST_DATE = "2024-01-15"
-    TEST_HUBS = ["NP15", "SP15", "ZP26"]
+    TEST_DATE               = "2024-01-15"
+    TEST_HUBS               = ["NP15", "SP15", "ZP26"]
+    TEST_BALANCING_AUTHORITY = "CISO"
 
+    # ------------------------------------------------------------------
+    # CAISO
+    # ------------------------------------------------------------------
     print("=" * 60)
-    print("Timestamp-fix smoke test: extract CAISO LMP → load to Snowflake")
-    print(f"Date  : {TEST_DATE}")
-    print(f"Hubs  : {TEST_HUBS}")
+    print("CAISO LMP  →  RAW.CAISO_LMP_5MIN")
+    print(f"Date : {TEST_DATE}  |  Hubs : {TEST_HUBS}")
     print("=" * 60)
 
-    # 1. Extract
-    print("\n--- Extraction ---")
-    df = extract_caiso_lmp(TEST_DATE, TEST_DATE, TEST_HUBS)
-    print(f"\nExtracted {len(df):,} rows.")
+    print("\n--- Extract ---")
+    caiso_df = extract_caiso_lmp(TEST_DATE, TEST_DATE, TEST_HUBS)
+    print(f"Extracted {len(caiso_df):,} rows.")
 
-    # 2. Truncate the table to clear previously corrupted timestamp data
-    print("\n--- Truncating RAW.CAISO_LMP_5MIN (clearing corrupted rows) ---")
-    truncate_table("CAISO_LMP_5MIN", schema="RAW")
+    print("\n--- Delete existing rows (idempotency) ---")
+    delete_existing_caiso_rows_for_date(TEST_DATE)
 
-    # 3. Load with clean string timestamps
     print("\n--- Load ---")
-    rows_loaded = load_dataframe_to_table(df, table_name="CAISO_LMP_5MIN", schema="RAW")
+    caiso_rows = load_dataframe_to_table(caiso_df, table_name="CAISO_LMP_5MIN", schema="RAW")
 
+    print(f"\n✓ CAISO done — {caiso_rows:,} rows in RAW.CAISO_LMP_5MIN")
+
+    # ------------------------------------------------------------------
+    # EIA
+    # ------------------------------------------------------------------
     print("\n" + "=" * 60)
-    print(f"Done. {rows_loaded:,} rows loaded into RAW.CAISO_LMP_5MIN.")
+    print("EIA Hourly  →  RAW.EIA_HOURLY_OPS")
+    print(f"Date : {TEST_DATE}  |  BA : {TEST_BALANCING_AUTHORITY}")
+    print("=" * 60)
+
+    print("\n--- Extract ---")
+    eia_df = extract_eia_hourly(
+        start_date=f"{TEST_DATE}T00",
+        end_date=f"{TEST_DATE}T23",
+        balancing_authority=TEST_BALANCING_AUTHORITY,
+    )
+    print(f"Extracted {len(eia_df):,} rows.")
+
+    print("\n--- Delete existing rows (idempotency) ---")
+    delete_existing_eia_rows_for_date(TEST_DATE, TEST_BALANCING_AUTHORITY)
+
+    print("\n--- Load ---")
+    eia_rows = load_dataframe_to_table(eia_df, table_name="EIA_HOURLY_OPS", schema="RAW")
+
+    print(f"\n✓ EIA done — {eia_rows:,} rows in RAW.EIA_HOURLY_OPS")
+
+    # ------------------------------------------------------------------
+    # Summary
+    # ------------------------------------------------------------------
+    print("\n" + "=" * 60)
+    print("Smoke test complete")
+    print(f"  RAW.CAISO_LMP_5MIN  : {caiso_rows:,} rows loaded")
+    print(f"  RAW.EIA_HOURLY_OPS  : {eia_rows:,} rows loaded")
     print("=" * 60)
