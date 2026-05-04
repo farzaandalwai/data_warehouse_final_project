@@ -3,18 +3,21 @@
 # Wholesale Electricity Market Stress and Price Spike Forecasting
 # =============================================================================
 #
-# Services:
-#   postgres          — Airflow metadata database
-#   airflow-init      — One-time DB migration + admin user creation
-#   airflow-webserver — Airflow UI on http://localhost:8080
-#   airflow-scheduler — Airflow task scheduler
-#   mlflow            — MLflow experiment tracking on http://localhost:5001
+# Services
+#   postgres      — Airflow metadata database (postgres:13)
+#   mlflow        — MLflow tracking server   → http://localhost:5001
+#   airflow-init  — One-shot DB migrate + admin user creation
+#   airflow       — Scheduler + webserver combined → http://localhost:8080
+#   airflow-cli   — Optional debug shell (profile: debug)
 #
-# Credentials loaded from: .env  (gitignored — never committed)
-# Start:  docker compose up -d
-# Stop:   docker compose down
-# Logs:   docker compose logs -f airflow-webserver
+# Credentials: loaded from .env (gitignored — never committed)
+#
+# Start : docker compose up -d
+# Stop  : docker compose down
+# Logs  : docker compose logs -f airflow
+# Debug : docker compose --profile debug run --rm airflow-cli
 # =============================================================================
+
 
 # ---------------------------------------------------------------------------
 # YAML anchor — shared config reused by all Airflow services
@@ -23,18 +26,22 @@ x-airflow-common:
   &airflow-common
   build: .
   env_file:
-    - .env                          # Snowflake + EIA credentials from local .env
+    - .env                            # Snowflake + EIA credentials — never hardcoded
   environment:
     &airflow-common-env
     AIRFLOW__CORE__EXECUTOR: LocalExecutor
     AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@postgres/airflow
-    AIRFLOW__CORE__LOAD_EXAMPLES: "false"
-    AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: "true"
+    AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: 'true'
+    AIRFLOW__CORE__LOAD_EXAMPLES: 'false'
     AIRFLOW__WEBSERVER__SECRET_KEY: temporary_class_project_secret
-    # dbt profile directory mounted into the container
+    AIRFLOW__API__AUTH_BACKENDS: 'airflow.api.auth.backend.basic_auth,airflow.api.auth.backend.session'
+    AIRFLOW__SCHEDULER__ENABLE_HEALTH_CHECK: 'true'
+    # dbt reads this to locate profiles.yml inside the container
     DBT_PROFILES_DIR: /opt/airflow/dbt_profiles
-    # MLflow tracking server running in its own container
-    MLFLOW_TRACKING_URI: http://mlflow:5000
+    # MLflow tracking server (same port the mlflow service listens on internally)
+    MLFLOW_TRACKING_URI: http://mlflow:5001
+    # Add project root to PYTHONPATH so DAG imports (scripts.*, dbt.*) resolve
+    PYTHONPATH: /opt/airflow
   volumes:
     - ./airflow/dags:/opt/airflow/dags
     - ./scripts:/opt/airflow/scripts
@@ -42,9 +49,6 @@ x-airflow-common:
     - ./dbt/profiles:/opt/airflow/dbt_profiles
     - ./logs:/opt/airflow/logs
     - ./mlruns:/opt/airflow/mlruns
-  depends_on:
-    postgres:
-      condition: service_healthy
 
 
 # ---------------------------------------------------------------------------
@@ -71,33 +75,74 @@ services:
       retries: 5
 
   # --------------------------------------------------------------------------
-  # airflow-init — runs once to migrate the DB and create the admin user
-  # Downstream services use condition: service_completed_successfully so they
-  # only start after this exits 0.
+  # mlflow — experiment tracking UI at http://localhost:5001
+  # Uses the official MLflow image with SQLite backend (class-project scale).
+  # Artifacts are stored in the named volume and bind-mounted to ./mlruns.
+  # --------------------------------------------------------------------------
+  mlflow:
+    image: ghcr.io/mlflow/mlflow:v2.13.0
+    restart: unless-stopped
+    command:
+      - mlflow
+      - server
+      - --backend-store-uri
+      - sqlite:////mlflow/mlflow.db
+      - --artifacts-destination
+      - /mlflow/artifacts
+      - --serve-artifacts
+      - --host
+      - "0.0.0.0"
+      - --port
+      - "5001"
+    ports:
+      - "5001:5001"
+    volumes:
+      - mlflow-data:/mlflow
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "http://localhost:5001/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+
+  # --------------------------------------------------------------------------
+  # airflow-init — runs once; migrates DB and creates admin user.
+  # Uses entrypoint /bin/bash so the command list is ["-c", "<script>"].
+  # The | block scalar preserves newlines, and \ continues the users create
+  # flags across lines — bash reads them as one command.
+  # `|| true` makes user creation idempotent (safe to re-run).
   # --------------------------------------------------------------------------
   airflow-init:
     <<: *airflow-common
     restart: "no"
-    command: >
-      bash -c "
-        airflow db migrate &&
-        airflow users create
-          --username admin
-          --password admin
-          --firstname Admin
-          --lastname User
-          --role Admin
-          --email admin@example.com
-      "
+    entrypoint: /bin/bash
+    command:
+      - -c
+      - |
+        airflow db migrate
+        airflow users create \
+          --username admin \
+          --password admin \
+          --firstname Admin \
+          --lastname User \
+          --role Admin \
+          --email admin@example.com || true
+    depends_on:
+      postgres:
+        condition: service_healthy
 
   # --------------------------------------------------------------------------
-  # airflow-webserver — Airflow UI at http://localhost:8080
-  # Login: admin / admin
+  # airflow — scheduler + webserver in one container (class-project setup).
+  # Scheduler runs in the background (&); webserver runs in the foreground.
+  # Login: admin / admin  → http://localhost:8080
   # --------------------------------------------------------------------------
-  airflow-webserver:
+  airflow:
     <<: *airflow-common
-    restart: unless-stopped
-    command: webserver
+    restart: always
+    command:
+      - bash
+      - -c
+      - airflow scheduler & airflow webserver
     ports:
       - "8080:8080"
     depends_on:
@@ -110,43 +155,21 @@ services:
       interval: 30s
       timeout: 10s
       retries: 5
-      start_period: 30s
+      start_period: 60s
 
   # --------------------------------------------------------------------------
-  # airflow-scheduler — triggers DAG runs on schedule
+  # airflow-cli — optional debug shell; only starts with --profile debug.
+  # Usage: docker compose --profile debug run --rm airflow-cli bash
   # --------------------------------------------------------------------------
-  airflow-scheduler:
+  airflow-cli:
     <<: *airflow-common
-    restart: unless-stopped
-    command: scheduler
-    depends_on:
-      postgres:
-        condition: service_healthy
-      airflow-init:
-        condition: service_completed_successfully
-
-  # --------------------------------------------------------------------------
-  # mlflow — experiment tracking UI at http://localhost:5001
-  # Uses SQLite for the backend store (adequate for a class project).
-  # Artifacts are written to /mlflow/mlruns which is bind-mounted to ./mlruns.
-  # --------------------------------------------------------------------------
-  mlflow:
-    image: python:3.11-slim
-    restart: unless-stopped
-    command: >
-      sh -c "
-        pip install --quiet mlflow &&
-        mlflow server
-          --host 0.0.0.0
-          --port 5000
-          --backend-store-uri sqlite:////mlflow/mlflow.db
-          --default-artifact-root /mlflow/mlruns
-      "
-    ports:
-      - "5001:5000"             # MLflow UI → http://localhost:5001
-    volumes:
-      - ./mlruns:/mlflow/mlruns
-      - mlflow-db-volume:/mlflow
+    profiles:
+      - debug
+    restart: "no"
+    entrypoint: /bin/bash
+    command:
+      - -c
+      - echo "Airflow CLI ready. Run airflow commands interactively."
 
 
 # ---------------------------------------------------------------------------
@@ -154,4 +177,4 @@ services:
 # ---------------------------------------------------------------------------
 volumes:
   postgres-db-volume:
-  mlflow-db-volume:
+  mlflow-data:

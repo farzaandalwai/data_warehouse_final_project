@@ -111,24 +111,18 @@ def extract_caiso_lmp(
         req = requests.Request("GET", CAISO_OASIS_URL, params=params).prepare()
         print(f"\n[{hub_upper}] Request URL:\n  {req.url}")
 
-        response = requests.get(CAISO_OASIS_URL, params=params, timeout=120)
-        print(f"[{hub_upper}] HTTP status: {response.status_code}  |  "
-              f"Content-Type: {response.headers.get('Content-Type', 'unknown')}  |  "
-              f"Size: {len(response.content):,} bytes")
-
-        if response.status_code != 200:
-            print(f"[{hub_upper}] Non-200 response. Body (first 1000 chars):\n"
-                  f"{response.text[:1000]}")
+        response = _fetch_with_retry(hub_upper, params)
+        if response is None:
             continue
 
         hub_df = _parse_zip_response(response, hub_upper)
         if hub_df is not None and not hub_df.empty:
             all_hub_dfs.append(hub_df)
 
-        # CAISO enforces a rate limit — wait between hub requests to avoid 429
+        # Wait between hub requests to avoid rate limiting
         if hub != trading_hubs[-1]:
-            print(f"[{hub_upper}] Waiting 6 seconds before next request ...")
-            time.sleep(6)
+            print(f"[{hub_upper}] Waiting 8 seconds before next hub request ...")
+            time.sleep(8)
 
     if not all_hub_dfs:
         print("\nNo data extracted for any hub. Returning empty DataFrame.")
@@ -140,6 +134,62 @@ def extract_caiso_lmp(
     combined["loaded_at"]     = datetime.now(timezone.utc).replace(tzinfo=None)
 
     return combined[OUTPUT_COLUMNS]
+
+
+# ---------------------------------------------------------------------------
+# HTTP fetch with exponential-backoff retry
+# ---------------------------------------------------------------------------
+
+# Backoff delays (seconds) for attempts 1-4 when a 429 or transient error occurs
+_BACKOFF_SECONDS = [6, 12, 24, 48]
+_MAX_ATTEMPTS = 4
+
+
+def _fetch_with_retry(hub: str, params: dict) -> requests.Response | None:
+    """
+    GET the CAISO OASIS endpoint with up to _MAX_ATTEMPTS retries.
+
+    - HTTP 429 → sleep according to exponential backoff, then retry.
+    - Any other non-200 → print body and retry (may be a transient XML error).
+    - All attempts exhausted → print final body and return None so the caller
+      can continue to the next hub instead of failing the whole extract.
+    """
+    last_response = None
+
+    for attempt in range(1, _MAX_ATTEMPTS + 1):
+        try:
+            response = requests.get(CAISO_OASIS_URL, params=params, timeout=120)
+        except requests.RequestException as exc:
+            print(f"[{hub}] Attempt {attempt}/{_MAX_ATTEMPTS} — request error: {exc}")
+            last_response = None
+        else:
+            last_response = response
+            print(
+                f"[{hub}] Attempt {attempt}/{_MAX_ATTEMPTS} — "
+                f"HTTP {response.status_code}  |  "
+                f"Content-Type: {response.headers.get('Content-Type', 'unknown')}  |  "
+                f"Size: {len(response.content):,} bytes"
+            )
+
+            if response.status_code == 200:
+                return response
+
+            print(f"[{hub}] Non-200 response body (first 1000 chars):\n{response.text[:1000]}")
+
+        # Decide how long to sleep before the next attempt
+        if attempt < _MAX_ATTEMPTS:
+            wait = _BACKOFF_SECONDS[attempt - 1]
+            status_hint = (
+                f"HTTP {last_response.status_code}" if last_response is not None else "connection error"
+            )
+            print(f"[{hub}] {status_hint} — retrying in {wait}s (attempt {attempt}/{_MAX_ATTEMPTS}) ...")
+            time.sleep(wait)
+
+    # All attempts failed
+    print(f"[{hub}] All {_MAX_ATTEMPTS} attempts failed. Skipping this hub.")
+    if last_response is not None:
+        print(f"[{hub}] Final response body (first 1000 chars):\n{last_response.text[:1000]}")
+    return None
 
 
 # ---------------------------------------------------------------------------
