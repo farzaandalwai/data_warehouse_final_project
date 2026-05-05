@@ -66,9 +66,10 @@ Data Sources
          │
          ▼
     Apache Airflow (ETL Orchestration)
-    ├── eia_hourly_etl_dag.py
-    ├── caiso_lmp_etl_dag.py
-    └── dbt_run_dag.py
+    ├── caiso_lmp_etl_dag.py    02:00 UTC
+    ├── eia_hourly_etl_dag.py   03:00 UTC
+    ├── dbt_run_dag.py          04:00 UTC
+    └── model_training_dag.py   05:00 UTC
          │
          ▼
     Snowflake — RAW Schema
@@ -77,10 +78,16 @@ Data Sources
          │
          ▼
     dbt ELT Transformations
-    ├── Staging  → STAGING.stg_eia_hourly_ops, stg_caiso_lmp
-    ├── Intermediate → INTERMEDIATE.int_hourly_market_features
-    └── Marts    → MART.mart_hourly_market_stress
-                   MART.mart_price_spike_dashboard
+    ├── STAGING       → stg_eia_hourly_ops, stg_caiso_lmp
+    ├── INTERMEDIATE  → int_hourly_market_features
+    └── MART          → mart_hourly_market_stress
+                        mart_price_spike_dashboard
+         │
+         ▼
+    ML Training (scikit-learn + MLflow)
+    ├── Logistic regression — price spike prediction
+    ├── ML.PRICE_SPIKE_PREDICTIONS
+    └── ML.PRICE_SPIKE_MODEL_METRICS
          │
          ▼
     Dashboard (Tableau / Power BI)
@@ -94,28 +101,44 @@ Data Sources
 
 ## Tools and Technologies
 
-| Layer             | Tool / Technology                        |
-|-------------------|------------------------------------------|
-| Data Warehouse    | Snowflake                                |
-| Orchestration     | Apache Airflow                           |
-| Transformation    | dbt (dbt-core + dbt-snowflake)           |
-| Ingestion Scripts | Python (requests, pandas)                |
-| ML / Forecasting  | scikit-learn                             |
-| Dashboard         | Tableau or Power BI                      |
-| Version Control   | GitHub                                   |
-| Environment Mgmt  | python-dotenv, environment variables     |
+| Layer              | Tool / Technology                              |
+|--------------------|------------------------------------------------|
+| Data Warehouse     | Snowflake                                      |
+| Orchestration      | Apache Airflow (Dockerized)                    |
+| Transformation     | dbt (dbt-core + dbt-snowflake)                 |
+| Ingestion Scripts  | Python (requests, pandas)                      |
+| ML / Forecasting   | scikit-learn (logistic regression)             |
+| Experiment Tracking| MLflow                                         |
+| Containerization   | Docker, Docker Compose                         |
+| Dashboard          | Tableau or Power BI                            |
+| Version Control    | GitHub                                         |
+| Environment Mgmt   | python-dotenv, environment variables           |
 
 ---
 
-## Current Project Scope
+## Current Status
 
-The first implementation phase will focus on **CAISO price data** (LMP from CAISO OASIS) as
-the primary data source. This includes building the full pipeline — ingestion, loading,
-staging, feature engineering, mart tables, and dashboard — end to end for CAISO.
+### Completed
 
-Once the CAISO pipeline is stable and validated, the project will expand to ingest
-**EIA hourly operations data** for broader grid-level context, enabling cross-BA analysis
-and improved forecasting features such as demand-supply imbalance indicators.
+- Snowflake database, schemas (`RAW`, `STAGING`, `INTERMEDIATE`, `MART`, `ML`), RAW tables, MART tables, and ML tables
+- CAISO OASIS API extraction with retry/backoff logic and Snowflake load
+- EIA Open Data API extraction with pagination support and Snowflake load
+- dbt transformations across all four layers: RAW → STAGING → INTERMEDIATE → MART
+- dbt data quality tests (26 passing tests across all models)
+- Airflow DAGs for CAISO ETL, EIA ETL, dbt run, and ML model training
+- Docker Compose environment for Airflow, PostgreSQL (metadata DB), and MLflow
+- Logistic regression price spike prediction model (ROC-AUC 0.987 on current data)
+- ML predictions and model metrics written to Snowflake ML schema
+- MLflow experiment tracking integrated into the training pipeline
+
+### Key Snowflake Tables
+
+| Table | Description |
+|---|---|
+| `ELECTRICITY_MARKET_DB.MART.MART_HOURLY_MARKET_STRESS` | Hourly LMP averages, lag features, spike flags |
+| `ELECTRICITY_MARKET_DB.MART.MART_PRICE_SPIKE_DASHBOARD` | Dashboard-ready aggregated view |
+| `ELECTRICITY_MARKET_DB.ML.PRICE_SPIKE_PREDICTIONS` | Per-hour model predictions for each trading hub |
+| `ELECTRICITY_MARKET_DB.ML.PRICE_SPIKE_MODEL_METRICS` | Evaluation metrics per trained model version |
 
 ---
 
@@ -123,32 +146,82 @@ and improved forecasting features such as demand-supply imbalance indicators.
 
 ```
 electricity-market-stress-analytics/
-├── README.md                        # This file
-├── requirements.txt                 # Python dependencies
+├── README.md
+├── requirements.txt
 ├── .gitignore
-├── sql/                             # Snowflake DDL scripts
+├── Dockerfile
+├── docker-compose.yml
+├── sql/
 │   ├── 01_create_database_schemas.sql
 │   ├── 02_create_raw_tables.sql
-│   └── 03_create_roles_users_grants.sql
-├── airflow/dags/                    # Airflow DAG definitions
-├── scripts/                         # Python ETL scripts
-├── dbt/electricity_market/          # dbt project
-│   └── models/
-│       ├── staging/
-│       ├── intermediate/
-│       └── marts/
-├── dashboards/                      # Dashboard specs and notes
-└── report/                          # Final report outline
+│   ├── 03_create_roles_users_grants.sql
+│   ├── 04_project_validation_queries.sql
+│   └── 05_create_ml_tables.sql
+├── airflow/
+│   └── dags/
+│       ├── caiso_lmp_etl_dag.py
+│       ├── eia_hourly_etl_dag.py
+│       ├── dbt_run_dag.py
+│       └── model_training_dag.py
+├── scripts/
+│   ├── extract_caiso_lmp.py
+│   ├── extract_eia_hourly.py
+│   ├── load_to_snowflake.py
+│   └── train_price_spike_model.py
+├── dbt/
+│   ├── profiles/
+│   │   └── profiles.yml
+│   └── electricity_market/
+│       ├── dbt_project.yml
+│       ├── macros/
+│       │   └── generate_schema_name.sql
+│       └── models/
+│           ├── sources.yml
+│           ├── schema.yml
+│           ├── staging/
+│           │   ├── stg_caiso_lmp.sql
+│           │   └── stg_eia_hourly_ops.sql
+│           ├── intermediate/
+│           │   └── int_hourly_market_features.sql
+│           └── marts/
+│               ├── mart_hourly_market_stress.sql
+│               └── mart_price_spike_dashboard.sql
+├── dashboards/
+│   └── README.md
+├── report/
+│   └── final_report_outline.md
+├── logs/
+│   └── .gitkeep
+└── mlruns/
+    └── .gitkeep
 ```
 
 ---
 
 ## Getting Started
 
+### Local development (without Docker)
+
 1. Clone this repository.
-2. Copy `.env.example` to `.env` and fill in your credentials (Snowflake, EIA API key).
+2. Create a `.env` file in the project root with your Snowflake credentials and EIA API key (see `.env` format in the project).
 3. Install dependencies: `pip install -r requirements.txt`
-4. Run Snowflake DDL scripts in order: `sql/01_` → `sql/02_` → `sql/03_`
-5. Configure Airflow and register the DAGs in `airflow/dags/`.
-6. Configure the dbt profile (`~/.dbt/profiles.yml`) to point at your Snowflake instance.
-7. Trigger the `caiso_lmp_etl_dag` DAG to begin ingestion.
+4. Run Snowflake DDL scripts in order: `sql/01_` → `sql/02_` → `sql/03_` → `sql/05_`
+5. Extract and load data: `python scripts/extract_caiso_lmp.py` and `python scripts/load_to_snowflake.py`
+6. Run dbt transformations from `dbt/electricity_market/`: `dbt run && dbt test`
+7. Train the model: `python scripts/train_price_spike_model.py`
+
+### Docker Compose (Airflow + MLflow)
+
+1. Ensure Docker Desktop is running.
+2. Place your `.env` file in the project root with all required credentials.
+3. Build and start all services:
+   ```bash
+   docker compose up --build -d
+   ```
+4. Airflow UI: [http://localhost:8080](http://localhost:8080) (admin / admin)
+5. MLflow UI: [http://localhost:5001](http://localhost:5001)
+6. Enable and trigger DAGs in the Airflow UI in this order:
+   - `caiso_lmp_etl_dag`
+   - `eia_hourly_etl_dag`
+   - `dbt_run_dag`
+   - `model_training_dag`
