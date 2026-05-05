@@ -366,7 +366,14 @@ def train_and_log_model() -> None:
             if roc_auc is not None:
                 mlflow.log_metric("roc_auc", roc_auc)
 
-            mlflow.sklearn.log_model(pipeline, artifact_path="model")
+            # Artifact logging is isolated so a storage/API failure does not
+            # mark the entire run as FAILED in the MLflow UI.
+            try:
+                mlflow.sklearn.log_model(pipeline, artifact_path="model")
+                print(f"[MLflow] Model artifact logged successfully.")
+            except Exception as artifact_err:
+                print(f"[MLflow] WARNING: Model artifact logging failed (run will still be marked FINISHED): {artifact_err}")
+
             print(f"[MLflow] Run logged: experiment='{EXPERIMENT}', run='{model_version}'")
     except Exception as mlflow_err:
         print(f"[MLflow] WARNING: Could not log to MLflow ({MLFLOW_URI}): {mlflow_err}")
